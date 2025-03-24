@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Scheduling Route53 DNS Records Backup using a Lambda function'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store DNS records backup
+  
+  BucketRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS Region where the S3 bucket is located
+
+Resources:
+  # S3 Bucket for storing Route53 backups
+  Route53BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # IAM Role for Lambda Function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Route53AndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZonesByName
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${Route53BackupBucket.Arn}/*'
+
+  # Lambda Function to perform Route53 backup
+  Route53BackupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: route53-dns-backup
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import csv
+          import json
+          import time
+          from datetime import datetime
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Configuration constants
+          BUCKET_NAME = os.environ['BUCKET_NAME']  # Replace with your actual S3 bucket name
+          BUCKET_REGION = os.environ['BUCKET_REGION']  # AWS region where the S3 bucket is located
+
+          # Initialize AWS service clients
+          s3_client = boto3.client('s3', region_name=BUCKET_REGION)
+          r53_client = boto3.client('route53')
+
+          def upload_file(dir_path, file_path, bkt_name, obj_key):
+              """
+              Upload a file to a specific folder in an Amazon S3 bucket.
+              
+              Args:
+              dir_path (str): The directory path in the S3 bucket
+              file_path (str): The local path of the file to upload
+              bkt_name (str): The name of the S3 bucket
+              obj_key (str): The object key (file name) in S3
+              """
+              full_key = f"{dir_path}/{obj_key}"
+              s3_client.upload_file(file_path, bkt_name, full_key)
+
+          def get_hosted_zones(next_marker=None):
+              """
+              Retrieve all hosted zones from Amazon Route 53, handling pagination.
+              
+              Args:
+              next_marker (tuple): Marker for pagination (DNSName, HostedZoneId)
+              
+              Returns:
+              list: All hosted zones in Route 53
+              """
+              params = {'DNSName': next_marker[0], 'HostedZoneId': next_marker[1]} if next_marker else {}
+              response = r53_client.list_hosted_zones_by_name(**params)
+              zones = response['HostedZones']
+              if response['IsTruncated']:
+                  # Recursively get the next batch of zones if the list is truncated
+                  zones.extend(get_hosted_zones((response['NextDNSName'], response['NextHostedZoneId'])))
+              return zones
+
+          def get_zone_info(zone_id):
+              """
+              Retrieve information about a specific hosted zone from Amazon Route 53.
+
+              Args:
+              zone_id (str): The ID of the hosted zone
+
+              Returns:
+              dict: Information about the hosted zone
+              """
+              info = r53_client.get_hosted_zone(Id=zone_id)
+              return info
+
+          def get_zone_records(zone_id, next_record=None):
+              """
+              Retrieve all DNS records for a specific hosted zone, handling pagination.
+              
+              Args:
+              zone_id (str): The ID of the hosted zone
+              next_record (tuple): Marker for pagination (RecordName, RecordType)
+              
+              Returns:
+              list: All DNS records in the specified hosted zone
+              """
+              params = {'HostedZoneId': zone_id}
+              if next_record:
+                  params.update({'StartRecordName': next_record[0], 'StartRecordType': next_record[1]})
+              response = r53_client.list_resource_record_sets(**params)
+              records = response['ResourceRecordSets']
+              if response['IsTruncated']:
+                  # Recursively get the next batch of records if the list is truncated
+                  records.extend(get_zone_records(zone_id, (response['NextRecordName'], response['NextRecordType'])))
+              return records
+
+          def get_record_value(record):
+              """
+              Extract the value(s) from a DNS record, handling both standard and alias records.
+              
+              Args:
+              record (dict): A DNS record from Route 53
+              
+              Returns:
+              list: The value(s) of the DNS record
+              """
+              if 'AliasTarget' in record:
+                  # Handle alias records
+                  return [f"ALIAS:{record['AliasTarget']['HostedZoneId']}:{record['AliasTarget']['DNSName']}"]
+              # Handle standard records
+              return [v['Value'] for v in record.get('ResourceRecords', [])]
+
+          def safe_get(dict_obj, key, default=''):
+              """
+              Safely retrieve a value from a dictionary, providing a default if the key doesn't exist.
+              
+              Args:
+              dict_obj (dict): The dictionary to search
+              key (str): The key to look for
+              default (any): The default value to return if the key is not found (default is '')
+              
+              Returns:
+              any: The value associated with the key, or the default value
+              """
+              if isinstance(dict_obj, dict):
+                  return dict_obj.get(key, default)
+              return default
+
+          def write_zone_info(zone_info):
+              """
+              Write zone information to a temporary file.
+
+              Args:
+              zone_info (dict): The zone information to write
+
+              Returns:
+              str: The path of the written file
+              """
+              file_name = f"/tmp/{zone['Name']}info.json"
+              file_path = os.path.join('/tmp', file_name)
+              with open(file_path, 'w') as f:
+                  json.dump(zone_info, f, indent=2)
+              return file_path
+
+          def write_zone_to_csv(zone, records):
+              """
+              Write the DNS records of a hosted zone to a CSV file.
+              
+              Args:
+              zone (dict): The hosted zone information
+              records (list): The DNS records of the zone
+              
+              Returns:
+              str: The path of the created CSV file
+              """
+              file_name = f"/tmp/{zone['Name']}csv"
+              with open(file_name, 'w', newline='') as csv_file:
+                  writer = csv.writer(csv_file)
+                  writer.writerow(['NAME', 'TYPE', 'VALUE', 'TTL', 'REGION', 'WEIGHT', 'SETID', 'FAILOVER', 'EVALUATE_HEALTH'])
+                  for record in records:
+                      base_row = [
+                          record['Name'],
+                          record['Type'],
+                          '',
+                          safe_get(record, 'TTL'),
+                          safe_get(record, 'Region'),
+                          safe_get(record, 'Weight'),
+                          safe_get(record, 'SetIdentifier'),
+                          safe_get(record, 'Failover'),
+                          safe_get(safe_get(record, 'AliasTarget'), 'EvaluateTargetHealth')
+                      ]
+                      for value in get_record_value(record):
+                          writer.writerow(base_row[:2] + [value] + base_row[3:])
+              return file_name
+
+          def write_zone_to_json(zone, records):
+              """
+              Write the DNS records of a hosted zone to a JSON file.
+              
+              Args:
+              zone (dict): The hosted zone information
+              records (list): The DNS records of the zone
+              
+              Returns:
+              str: The path of the created JSON file
+              """
+              file_name = f"/tmp/{zone['Name']}json"
+              with open(file_name, 'w') as json_file:
+                  json.dump(records, json_file, indent=4)
+              return file_name
+
+          def lambda_handler(event, context):
+              """
+              Main handler function for the AWS Lambda.
+              This function orchestrates the backup process for all Route 53 hosted zones.
+              
+              Args:
+              event (dict): The event dict that triggers the Lambda function
+              context (object): Provides methods and properties about the invocation, function, and execution environment
+              
+              Returns:
+              bool: True if the backup process completed successfully, False otherwise
+              """
+              timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+              
+              for zone in get_hosted_zones():
+                  # Extract zone ID from the full ID string (removing '/hostedzone/')
+                  zone_id = zone['Id'].split('/')[-1]
+                  # Create a unique folder name for each zone backup
+                  zone_folder = f"{timestamp}/{zone['Name'][:-1]}_{zone_id}"
+                  zone_records = get_zone_records(zone['Id'])
+                  zone_info = get_zone_info(zone['Id'])
+                  
+                  for file_type in ['csv', 'json']:
+                      # Choose the appropriate function based on the file type
+                      file_func = write_zone_to_csv if file_type == 'csv' else write_zone_to_json
+                      file_path = file_func(zone, zone_records)
+                      obj_key = f"{zone['Name']}{file_type}"
+                      upload_file(zone_folder, file_path, BUCKET_NAME, obj_key)
+
+                  file_path = file_func(zone, zone_info)
+                  obj_key = f"zone_info_{zone['Name']}json"
+                  upload_file(zone_folder, file_path, BUCKET_NAME, obj_key)
+                  
+              return True
+
+          if __name__ == "__main__":
+              lambda_handler(None, None)
+
+
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          BUCKET_REGION: !Ref BucketRegion
+      MemorySize: 256
+      Timeout: 300
+      TracingConfig:
+        Mode: Active
+
+  # EventBridge Scheduler Schedule to invoke Route53 backup Lambda
+  Route53BackupDailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: Route53BackupDailySchedule
+      Description: Triggers Lambda function daily
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: rate(1 days)  # Runs daily at deployment time UTC
+      Target:
+        Arn: !GetAtt Route53BackupFunction.Arn
+        RoleArn: !GetAtt Route53BackupSchedulerRole.Arn
+
+  # IAM Role for EventBridge Scheduler Lambda execution
+  Route53BackupSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Route53BackupFunction.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt Route53BackupFunction.Arn
+
+  S3BucketName:
+    Description: "Name of the S3 bucket storing the backups"
+    Value: !Ref Route53BackupBucket
+
+  LambdaRoleArn:
+    Description: "ARN of the Lambda execution role"
+    Value: !GetAtt LambdaExecutionRole.Arn
