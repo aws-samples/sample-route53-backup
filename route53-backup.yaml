@@ -1,15 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for Scheduling Route53 DNS Records Backup using a Lambda function'
+Description: 'CloudFormation template for Scheduling Route53 DNS Records Backup using a Lambda function and EventBridge'
 
 Parameters:
   BucketName:
     Type: String
-    Description: Name of the S3 bucket to store DNS records backup
+    Description: Provide a name for the S3 bucket to store the DNS records backup - must be globally unique
   
   BucketRegion:
     Type: String
     Default: us-east-1
-    Description: AWS Region where the S3 bucket is located
+    Description: AWS Region where the S3 bucket will be located
 
 Resources:
   # S3 Bucket for storing Route53 backups
