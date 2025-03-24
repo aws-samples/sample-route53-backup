@@ -10,7 +10,7 @@ Here is the architecture of the AWS services used to build the backup solution:
 ![Architecture Diagram](/img/figure1.jpg)
 
 The workflow of the automated Route 53 backup solution is as follows: 
-1. EventBridge triggers the Lambda function on a specified schedule 
+1. EventBridge triggers the Lambda function on a daily schedule
 2. Lambda executes a script to record all DNS record data 
 3. Data is stored in S3 in both JSON and CSV formats
 
@@ -50,7 +50,7 @@ Another option would be to trigger the Route 53 backup Lambda on an event instea
 
 ## Clean up
 - To clean up and remove the solution, first delete all of the backup data in the backup S3 bucket
-- Once the S3 bucket is empty, you can use CloudFormation to delete the original stack to remove all other resources
+- Once the S3 bucket is empty, you can use CloudFormation to delete the original stack to remove all resources
 
 
 ## License
