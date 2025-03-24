@@ -7,7 +7,7 @@ This solution helps protect against Route 53 data deletion by automating backups
 
 ### Architecture and Overview
 Here is the architecture of the AWS services used to build the backup solution:
-![Architecture Diagram](/img/figure1.png)
+![Architecture Diagram](/img/figure1.jpg)
 
 The workflow of the automated Route 53 backup solution is as follows: 
 1. EventBridge triggers the Lambda function on a specified schedule 
