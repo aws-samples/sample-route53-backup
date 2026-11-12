@@ -281,7 +281,7 @@ Resources:
 
       Environment:
         Variables:
-          BUCKET_NAME: !Ref BucketName
+          BUCKET_NAME: !Ref Route53BackupBucket
           BUCKET_REGION: !Ref BucketRegion
       MemorySize: 256
       Timeout: 300
